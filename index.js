@@ -28,7 +28,7 @@ function resolve (baseURI, relativeURI, options) {
   const schemelessOptions = options ? Object.assign({ scheme: 'null' }, options) : { scheme: 'null' }
   const baseResult = parseWithStatus(baseURI, schemelessOptions)
   const relativeResult = parseWithStatus(relativeURI, schemelessOptions)
-  if (baseResult.malformedAuthorityOrPort || relativeResult.malformedAuthorityOrPort) {
+  if (baseResult.malformedAuthorityOrPort || relativeResult.malformedAuthorityOrPort || baseResult.malformedHost || relativeResult.malformedHost) {
     throw new Error(baseResult.parsed.error || relativeResult.parsed.error || 'URI is malformed.')
   }
   const resolved = resolveComponent(baseResult.parsed, relativeResult.parsed, schemelessOptions, true)
@@ -255,6 +255,7 @@ function getParseError (parsed, matches) {
  * @param {import('./types/index').Options} options
  * @param {{ domainHost?: boolean, unicodeSupport?: boolean }|undefined} schemeHandler
  * @param {boolean} isIP
+ * @returns {boolean} whether host conversion failed
  */
 function canonicalizeHost (parsed, options, schemeHandler, isIP) {
   if (
@@ -269,14 +270,16 @@ function canonicalizeHost (parsed, options, schemeHandler, isIP) {
       parsed.host = new URL('http://' + parsed.host).hostname
     } catch (e) {
       parsed.error = parsed.error || "Host's domain name can not be converted to ASCII: " + e
+      return true
     }
   }
+  return false
 }
 
 /**
  * @param {string} uri
  * @param {import('./types/index').Options} [opts]
- * @returns {{ parsed: import('./types/index').URIComponent, malformedAuthorityOrPort: boolean }}
+ * @returns {{ parsed: import('./types/index').URIComponent, malformedAuthorityOrPort: boolean, malformedHost: boolean }}
  */
 function parseWithStatus (uri, opts) {
   const options = Object.assign({}, opts)
@@ -292,6 +295,7 @@ function parseWithStatus (uri, opts) {
   }
 
   let malformedAuthorityOrPort = false
+  let malformedHost = false
 
   let isIP = false
   if (options.reference === 'suffix') {
@@ -389,15 +393,20 @@ function parseWithStatus (uri, opts) {
     const schemeHandler = getSchemeHandler(options.scheme || parsed.scheme)
 
     // convert Unicode IDN -> ASCII IDN when the effective scheme uses domain hosts
-    canonicalizeHost(parsed, options, schemeHandler, isIP)
+    malformedHost = canonicalizeHost(parsed, options, schemeHandler, isIP)
 
     if (!schemeHandler || (schemeHandler && !schemeHandler.skipNormalize)) {
       if (uri.indexOf('%') !== -1) {
         if (parsed.scheme !== undefined) {
           parsed.scheme = unescape(parsed.scheme)
         }
-        if (parsed.host !== undefined) {
-          parsed.host = reescapeHostDelimiters(unescape(parsed.host), isIP)
+        // An IP host was already normalized above; its only "%" is the IPv6 zone
+        // separator (with any "%25" escape consumed), so it must not be decoded again.
+        if (parsed.host !== undefined && !isIP) {
+          // Decode only current unreserved escapes, once. Using unescape() here
+          // decodes every escape and lets a nested escape (e.g. %252e -> %2e -> .)
+          // reparse as a live delimiter, redirecting to a different host.
+          parsed.host = reescapeHostDelimiters(normalizePercentEncoding(parsed.host, true), isIP)
         }
       }
       if (parsed.path) {
@@ -419,7 +428,7 @@ function parseWithStatus (uri, opts) {
   } else {
     parsed.error = parsed.error || 'URI can not be parsed.'
   }
-  return { parsed, malformedAuthorityOrPort }
+  return { parsed, malformedAuthorityOrPort, malformedHost }
 }
 
 /**
@@ -443,13 +452,14 @@ function normalizeString (uri, opts) {
 /**
  * @param {string} uri
  * @param {import('./types/index').Options} [opts]
- * @returns {{ normalized: string, malformedAuthorityOrPort: boolean }}
+ * @returns {{ normalized: string, malformedAuthorityOrPort: boolean, malformedHost: boolean }}
  */
 function normalizeStringWithStatus (uri, opts) {
-  const { parsed, malformedAuthorityOrPort } = parseWithStatus(uri, opts)
+  const { parsed, malformedAuthorityOrPort, malformedHost } = parseWithStatus(uri, opts)
   return {
-    normalized: malformedAuthorityOrPort ? uri : serialize(parsed, opts),
-    malformedAuthorityOrPort
+    normalized: malformedAuthorityOrPort || malformedHost ? uri : serialize(parsed, opts),
+    malformedAuthorityOrPort,
+    malformedHost
   }
 }
 
@@ -460,8 +470,8 @@ function normalizeStringWithStatus (uri, opts) {
  */
 function normalizeComparableURI (uri, opts) {
   if (typeof uri === 'string') {
-    const { normalized, malformedAuthorityOrPort } = normalizeStringWithStatus(uri, opts)
-    return malformedAuthorityOrPort ? undefined : normalized
+    const { normalized, malformedAuthorityOrPort, malformedHost } = normalizeStringWithStatus(uri, opts)
+    return malformedAuthorityOrPort || malformedHost ? undefined : normalized
   }
 
   if (typeof uri === 'object') {
