@@ -387,7 +387,11 @@ function normalizeComparableURI (uri, opts) {
   }
 
   if (typeof uri === 'object') {
-    return serialize(uri, opts)
+    try {
+      return serialize(uri, opts)
+    } catch {
+      return undefined
+    }
   }
 }
 
