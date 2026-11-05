@@ -28,6 +28,9 @@ function resolve (baseURI, relativeURI, options) {
   const schemelessOptions = options ? Object.assign({ scheme: 'null' }, options) : { scheme: 'null' }
   const baseResult = parseWithStatus(baseURI, schemelessOptions)
   const relativeResult = parseWithStatus(relativeURI, schemelessOptions)
+  if (baseResult.malformedIPLiteral || relativeResult.malformedIPLiteral) {
+    throw new Error('URI host is malformed.')
+  }
   if (baseResult.malformedAuthorityOrPort || relativeResult.malformedAuthorityOrPort || baseResult.malformedHost || relativeResult.malformedHost) {
     throw new Error(baseResult.parsed.error || relativeResult.parsed.error || 'URI is malformed.')
   }
@@ -262,6 +265,10 @@ function canonicalizeHost (parsed, options, schemeHandler, isIP) {
     !options.unicodeSupport &&
     (!schemeHandler || !schemeHandler.unicodeSupport) &&
     parsed.host &&
+    // A bracketed IP literal (RFC 3986 `IP-literal`) is never a reg-name, so it
+    // must not be handed to the WHATWG hostname parser. An unterminated "[" is
+    // not a literal and is still validated as a reg-name below.
+    !isIPLiteral(parsed.host) &&
     (options.domainHost || (schemeHandler && schemeHandler.domainHost)) &&
     isIP === false &&
     nonSimpleDomain(parsed.host)
@@ -277,9 +284,17 @@ function canonicalizeHost (parsed, options, schemeHandler, isIP) {
 }
 
 /**
+ * @param {string} host
+ * @returns {boolean}
+ */
+function isIPLiteral (host) {
+  return host[0] === '[' && host[host.length - 1] === ']'
+}
+
+/**
  * @param {string} uri
  * @param {import('./types/index').Options} [opts]
- * @returns {{ parsed: import('./types/index').URIComponent, malformedAuthorityOrPort: boolean, malformedHost: boolean }}
+ * @returns {{ parsed: import('./types/index').URIComponent, malformedAuthorityOrPort: boolean, malformedIPLiteral: boolean, malformedHost: boolean }}
  */
 function parseWithStatus (uri, opts) {
   const options = Object.assign({}, opts)
@@ -295,6 +310,7 @@ function parseWithStatus (uri, opts) {
   }
 
   let malformedAuthorityOrPort = false
+  let malformedIPLiteral = false
   let malformedHost = false
 
   let isIP = false
@@ -367,9 +383,17 @@ function parseWithStatus (uri, opts) {
     if (parsed.host) {
       const ipv4result = isIPv4(parsed.host)
       if (ipv4result === false) {
+        const bracketedIPLiteral = isIPLiteral(parsed.host)
+        const hasIPLiteralBracket = parsed.host.indexOf('[') !== -1 || parsed.host.indexOf(']') !== -1
         const ipv6result = normalizeIPv6(parsed.host)
-        parsed.host = ipv6result.host.toLowerCase()
-        isIP = ipv6result.isIPV6
+        isIP = ipv6result.isIPV6 || ipv6result.isIPVFuture === true
+        malformedIPLiteral = (hasIPLiteralBracket && !bracketedIPLiteral) || (bracketedIPLiteral && ipv6result.error === true)
+        parsed.host = isIP ? ipv6result.host : ipv6result.host.toLowerCase()
+
+        if (malformedIPLiteral) {
+          parsed.error = parsed.error || 'URI host is malformed.'
+          malformedAuthorityOrPort = true
+        }
       } else {
         isIP = true
       }
@@ -393,7 +417,10 @@ function parseWithStatus (uri, opts) {
     const schemeHandler = getSchemeHandler(options.scheme || parsed.scheme)
 
     // convert Unicode IDN -> ASCII IDN when the effective scheme uses domain hosts
-    malformedHost = canonicalizeHost(parsed, options, schemeHandler, isIP)
+    // (a malformed IP-literal host is left as-is so it is not rewritten)
+    if (!malformedIPLiteral) {
+      malformedHost = canonicalizeHost(parsed, options, schemeHandler, isIP)
+    }
 
     if (!schemeHandler || (schemeHandler && !schemeHandler.skipNormalize)) {
       if (uri.indexOf('%') !== -1) {
@@ -402,7 +429,7 @@ function parseWithStatus (uri, opts) {
         }
         // An IP host was already normalized above; its only "%" is the IPv6 zone
         // separator (with any "%25" escape consumed), so it must not be decoded again.
-        if (parsed.host !== undefined && !isIP) {
+        if (parsed.host !== undefined && !malformedIPLiteral && !isIP) {
           // Decode only current unreserved escapes, once. Using unescape() here
           // decodes every escape and lets a nested escape (e.g. %252e -> %2e -> .)
           // reparse as a live delimiter, redirecting to a different host.
@@ -428,7 +455,7 @@ function parseWithStatus (uri, opts) {
   } else {
     parsed.error = parsed.error || 'URI can not be parsed.'
   }
-  return { parsed, malformedAuthorityOrPort, malformedHost }
+  return { parsed, malformedAuthorityOrPort, malformedIPLiteral, malformedHost }
 }
 
 /**
